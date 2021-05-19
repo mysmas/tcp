@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.0)
+project(TCP_DEMO)
+include_directories(../3rd/asio-1.16.0/include)
+Add_Definitions(-DBOOST_ASIO_SEPARATE_COMPILATION) 
+set(SRC ../include/tcp.hpp ../src/tcpdemo.cpp)
+add_executable(tcpdemo ${SRC})
