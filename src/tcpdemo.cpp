@@ -1,7 +1,7 @@
 #include <iostream>
 #include <thread>
 
-#include "../include/Tcp.hpp"
+#include "../include/tcp.hpp"
 
 
 int main()
