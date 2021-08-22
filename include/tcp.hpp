@@ -12,425 +12,369 @@
 #include <map>
 #include <queue>
 #include <chrono>
+#include <functional>
 
 #include "../3rd/asio-1.16.0/include/asio.hpp"
 
-namespace Tcp
+namespace posix { namespace tcp
 {
-	const int server_max_buf_size = 1024 * 500;
-	const int client_max_buf_size = 1024 * 500;
+	constexpr int max_receive_size = 1024 * 1;
 
 	typedef struct _protocol_head
 	{
 		int size;
 	}protocol_head;
 
-	class client_data :public std::enable_shared_from_this<client_data>
+	class ClientData :public std::enable_shared_from_this<ClientData>
 	{
 	public:
-		client_data() = delete;
-		client_data(const std::string& id)
-			:m_id(id)
-			, m_receive_count(0) {
-			m_buf.fill('\0');
+		ClientData(const std::string& id)
+			:id_(id)
+			, receive_count_(0) 
+			, receive_count_last_(0)
+			, send_count_(0)
+			, send_count_last_(0)
+		{
 		};
-		~client_data() {};
+		~ClientData() {};
 	public:
-		std::string m_id;
-		std::array<char, server_max_buf_size> m_buf;
-		std::queue <std::shared_ptr<std::vector<char>>> m_send_queue;
-		std::chrono::system_clock::time_point m_connect_time_point;
-		std::chrono::system_clock::time_point m_receive_time_point;
-		std::chrono::system_clock::time_point m_send_time_point;
-		std::size_t m_receive_count;
-		std::size_t m_receive_count_last;
-		std::size_t m_send_count;
-		std::size_t m_send_count_last;
+		std::string id_;
+		std::vector<char> buf_;
+		std::queue <std::shared_ptr<std::vector<char>>> send_queue_;
+		std::chrono::system_clock::time_point connect_time_point_;
+		std::chrono::system_clock::time_point receive_time_point_;
+		std::chrono::system_clock::time_point send_time_point_;
+		std::size_t receive_count_;
+		std::size_t receive_count_last_;
+		std::size_t send_count_;
+		std::size_t send_count_last_;
 	};
 
-	std::vector<char> PackData(const char* buf, const int& size)
+	std::shared_ptr<std::vector<char>> PackData(const char* buf, const int& size)
 	{
-		std::vector<char> data;
-		protocol_head head;
-		head.size = sizeof(protocol_head) + size;
-		data.insert(data.end(), (char*)(&head), (char*)(&head) + sizeof(protocol_head));
-		data.insert(data.end(), buf, buf + size);
-		return std::move(data);
+		auto ret = std::make_shared<std::vector<char>>();
+		if (!ret) { return nullptr; }
+		ret->resize(sizeof(protocol_head) + size);
+		auto head = reinterpret_cast<protocol_head*>(ret->data());
+		head->size = sizeof(protocol_head) + size;
+		std::memcpy(ret->data() + sizeof(protocol_head), buf, size);
+		return std::move(ret);
 	}
 
 	std::string GetId(std::shared_ptr<asio::ip::tcp::socket> s)
 	{
-		if (s)
-			return  s->remote_endpoint().address().to_string() + ":" + std::to_string(s->remote_endpoint().port());
-		else
-			return std::string();
+		if (s) { return  s->remote_endpoint().address().to_string() + ":" + std::to_string(s->remote_endpoint().port()); }	
+		else { return std::string(); }
 	}
 
-	class CTcpServer
+	class TcpServer
 	{
 	public:
-		CTcpServer() = delete;
-		CTcpServer(const std::string& ip = "",
+		using on_log_type = std::function<bool(const std::string& msg)>;
+		using on_accept_type = std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client)>;
+		using on_send_type = std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size)>;
+		using on_pre_receive_type = std::function<int(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size)>;
+		using on_receive_type = std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size, on_send_type on_send)>;
+		using client_data_map_type = std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<ClientData>>;
+		using on_timer_type = std::function<bool(std::chrono::milliseconds& milliseconds, client_data_map_type&)>;
+		
+	public:
+		TcpServer() = delete;
+		TcpServer(
+			const std::string& ip = "0.0.0.0",
 			const std::string& port = "8000",
-			std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client)> accept_client_callback_fun = nullptr,
-			std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const std::string& error)> close_client_callback_fun = nullptr,
-			std::function<bool(std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size)> async_send_fun, std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size)> handle_buf_callback_fun = nullptr,
-			std::function<bool(std::chrono::milliseconds& milliseconds, std::shared_ptr<std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>>>)> timer_callback_fun = nullptr,
-			std::function<bool(const std::string& msg)> log_callback_fun = nullptr)
-			: m_ip(ip)
-			, m_port(port)
-			, m_appEnable(true)
-			, m_strand(m_io_context_)
-			, m_accept_client_callback_fun(accept_client_callback_fun)
-			, m_close_client_callback_fun(close_client_callback_fun)
-			, m_deal_buf_callback_fun(handle_buf_callback_fun)
-			, m_timer_callback_fun(timer_callback_fun)
-			, m_log_callback_fun(m_log_callback_fun)
-			, m_check_client_timer(m_io_context_)
-			, m_timer(m_io_context_)
+			on_receive_type on_receive = nullptr,
+			on_log_type on_log = nullptr,
+			on_accept_type on_accept = nullptr,
+			on_timer_type on_timer = nullptr,
+			on_pre_receive_type on_pre_receive = [](std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size) { 
+				auto receive_length = ((const protocol_head*)data)->size;
+				if (receive_length > max_receive_size || receive_length < sizeof(protocol_head)) { return -1; }
+				return receive_length;
+			}
+			)
+			: ip_(ip)
+			, port_(port)
+			, running_(true)
+			, strand_(io_context_)
+			, check_client_timer_(io_context_)
+			, timer_(io_context_)
+			, on_receive_(on_receive)
+			, on_accept_(on_accept)
+			, on_log_(on_log)
+			, on_timer_(on_timer)
+
+
 		{
 		};
 
-		~CTcpServer() {
-			m_io_context_.post([this]()
-				{
-					m_appEnable = false;
-
-					m_acceptor_->close();
-
-					__delete_client();
-
-					m_work.reset();
-				});
-
-			for (auto& t : m_threads)
+		~TcpServer() {
+			running_ = false;
+			work_.reset();
+			acceptor_->close();
+			io_context_.stop();
+			while (!io_context_.stopped()) { std::this_thread::sleep_for(std::chrono::seconds(1)); };
+			DeleteClient();
+			for (auto& t : threads_)
 			{
 				t.join();
 			}
 		};
 	public:
-		bool run() {
+		bool Run() {
 			try
 			{
-				m_acceptor_ = std::make_shared<asio::ip::tcp::acceptor>(m_io_context_, m_ip.empty() ? asio::ip::tcp::endpoint(asio::ip::tcp::v4(), atoi(m_port.c_str())) : asio::ip::tcp::endpoint(asio::ip::address::from_string(m_ip.c_str()), atoi(m_port.c_str())));
+				acceptor_ = std::make_shared<asio::ip::tcp::acceptor>(io_context_, ip_.empty() ? asio::ip::tcp::endpoint(asio::ip::tcp::v4(), atoi(port_.c_str())) : asio::ip::tcp::endpoint(asio::ip::address::from_string(ip_.c_str()), atoi(port_.c_str())));
 			}
 			catch (std::exception& e)
 			{
 				std::string error = e.what();
-				if (m_log_callback_fun != nullptr)
-				{
-					m_log_callback_fun(error);
-				}
+				if (on_log_ != nullptr) { on_log_("run error: " + error); }
 				return false;
 			};
 
-			_async_accept();
-			__check_client();
-			__timer();
+			AsyncAccept();
+			CheckClient();
+			DoTimer();
 
-			m_work = std::make_shared<asio::io_service::work>(asio::io_service::work(m_io_context_));
+			work_ = std::make_shared<asio::io_service::work>(asio::io_service::work(io_context_));
 
-			while (m_threads.size() < 4)
+			while (threads_.size() < 4)
 			{
-				m_threads.emplace_back(std::thread([this]()
+				threads_.emplace_back(std::thread([this]()
 					{
 						do
 						{
 							try
 							{
-								m_io_context_.run();
+								io_context_.run();
 								break;
 							}
 							catch (std::exception& e)
 							{
 								std::string error = e.what();
-								if (m_log_callback_fun != nullptr)
-								{
-									m_log_callback_fun(error);
-								}
+								if (on_log_ != nullptr) { on_log_("run error: " + error); }
 							};
-						} while (m_appEnable);
+						} while (running_);
 					}));
 			};
-
+			if (on_log_ != nullptr) { on_log_("server run ..."); };
 			return true;
 		};
 	private:
-		bool _async_accept() {
-			if (!m_appEnable)
-			{
-				return false;
-			}
+		bool AsyncAccept() {
+			if (!running_) { return false; }
 
-			std::shared_ptr<asio::ip::tcp::socket> client = std::make_shared<asio::ip::tcp::socket>(m_io_context_);
+			std::shared_ptr<asio::ip::tcp::socket> client = std::make_shared<asio::ip::tcp::socket>(io_context_);
 
-			if (client == nullptr || m_acceptor_ == nullptr)
-			{
-				return false;
-			}
-
-			m_acceptor_->async_accept(*client, m_strand.wrap([this, client](std::error_code ec) {
+			if (client == nullptr || acceptor_ == nullptr) { return false; }
+			
+			acceptor_->async_accept(*client, strand_.wrap([this, client](std::error_code ec) {
 				if (ec)
 				{
+					if (on_log_ != nullptr) { on_log_("asyncAccept error: " + ec.message() + " code: " + std::to_string(ec.value())); }
 					return false;
 				}
 
-				auto id = client->remote_endpoint().address().to_string() + ": " + std::to_string(client->remote_endpoint().port());
-
-				if (m_accept_client_callback_fun != nullptr)
-				{
-					if (!m_accept_client_callback_fun(client))
-					{
-						if (m_close_client_callback_fun != nullptr)
-						{
-							m_close_client_callback_fun(client, "accept client fail.");
-						}
-						client->close();
-					}
-				}
+				if (on_accept_ != nullptr) 
+				{ 
+					if (!on_accept_(client) && running_) 
+					{ 
+						AsyncAccept();
+						return false; 
+					};
+				};
 
 				if (client->is_open())
 				{
-					std::unique_lock<decltype(m_client_data_mutex)> lock(m_client_data_mutex);
-					if (m_client_data_map.find(client) == m_client_data_map.end())
+					auto id = GetId(client);
+
+					if (on_log_ != nullptr) { on_log_("server accept: " + id); };
+
+					if (client_data_map_.find(client) == client_data_map_.end())
 					{
-						m_client_data_map[client] = std::shared_ptr<client_data>(new client_data(id));
+						client_data_map_[client] = std::make_shared<ClientData>(id);
 					}
 					else
 					{
-						m_client_data_map[client]->m_id = id;
-						while (!m_client_data_map[client]->m_send_queue.empty())
-						{
-							m_client_data_map[client]->m_send_queue.pop();
-						}
-						m_client_data_map[client]->m_buf.fill('\0');
+						client_data_map_[client]->id_ = id;
+						while (!client_data_map_[client]->send_queue_.empty()) { client_data_map_[client]->send_queue_.pop(); }
 					}
-					m_client_data_map[client]->m_connect_time_point = std::chrono::system_clock::now();
-					lock.unlock();
-
-					_async_receive(client, m_client_data_map[client]);
+					client_data_map_[client]->connect_time_point_ = std::chrono::system_clock::now();
+					AsyncReceive(client);						
 				}
 
-				if (m_appEnable)
-				{
-					_async_accept();
-				}
+				if (running_) { AsyncAccept(); }
 				return true;
 				}));
-
 			return true;
 		};
-		bool _async_send(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size) {
-			if (!m_appEnable)
-			{
-				return false;
-			}
 
-			if (buf == nullptr || client == nullptr)
-			{
-				return false;
-			}
+		bool AsyncSend(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size) {
+			if (!running_ || data == nullptr || client == nullptr || !client->is_open()) { return false; }
 
-			if (!client->is_open())
-			{
-				return false;
-			}
-
-			std::shared_ptr<std::vector<char>> buf_ = std::make_shared<std::vector<char>>(buf, buf + size);
-
-			if (buf_ == nullptr)
-			{
-				return false;
-			}
-
-			asio::post(m_io_context_, m_strand.wrap([this, client, data, buf_]()
+			std::shared_ptr<std::vector<char>> buf_ = std::make_shared<std::vector<char>>(data, data + size);
+			if (buf_ == nullptr) { return false; }
+			auto& client_data = client_data_map_[client];
+			asio::post(io_context_, strand_.wrap([this, client, client_data, buf_]()
 				{
-					data->m_send_queue.emplace(buf_);
-					__queue_send(client, data);
-
+					client_data->send_queue_.emplace(buf_);
+					QueueSend(client);
 					return true;
 
 				}));
-
 			return true;
 		};
-		bool _async_receive(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data) {
-			if (!m_appEnable)
+
+		bool AsyncReceive(std::shared_ptr<asio::ip::tcp::socket> client) {
+			if (!running_ || client == nullptr || !client->is_open()) { return false; }
+
+			auto& client_data = client_data_map_[client];
+
+			if (on_pre_receive_)
 			{
-				return false;
-			}
-
-			if (client == nullptr || data == nullptr)
-			{
-				return false;
-			}
-
-			if (!client->is_open())
-			{
-				return false;
-			}
-
-			data->m_buf.fill('\0');
-
-			asio::async_read(*client, asio::buffer(data->m_buf.data(), sizeof(protocol_head)), m_strand.wrap([this, client, data](std::error_code ec, std::size_t length)
-				{
-					if (ec)
+				client_data->buf_.resize(sizeof(protocol_head));
+				asio::async_read(*client, asio::buffer(client_data->buf_.data(), client_data->buf_.size()), strand_.wrap([this, client, client_data](std::error_code ec, std::size_t length)
 					{
-						if (m_close_client_callback_fun != nullptr)
+						if (ec)
 						{
-							m_close_client_callback_fun(client, "async_read fail. ec: " + ec.message());
-						}
-						client->close();
-						return false;
-					};
+							if (on_log_ != nullptr) { on_log_("async_read fail. close client: " + GetId(client) + " ec: " + ec.message()); }
+							client->close();
+							return false;
+						};
 
-					int size = ((const protocol_head*)data->m_buf.data())->size;
-					if (size > data->m_buf.size() || sizeof(protocol_head) > size)
-					{
-						if (m_close_client_callback_fun != nullptr)
+						auto receive_length = on_pre_receive_(client, client_data->buf_.data(), client_data->buf_.size());
+						if (receive_length > 0)
 						{
-							m_close_client_callback_fun(client, "async_read size error.");
-						}
-						client->close();
-						return false;
-					}
-
-					asio::async_read(*client, asio::buffer(data->m_buf.data() + sizeof(protocol_head), size - sizeof(protocol_head)), m_strand.wrap([this, client, data, size](std::error_code ec, std::size_t length)
-						{
-							if (ec)
-							{
-								if (m_close_client_callback_fun != nullptr)
+							client_data->buf_.resize(receive_length);
+							asio::async_read(*client, asio::buffer(client_data->buf_.data() + sizeof(protocol_head), receive_length - sizeof(protocol_head)), strand_.wrap([this, client, client_data, receive_length](std::error_code ec, std::size_t length)
 								{
-									m_close_client_callback_fun(client, "async_read fail. ec: " + ec.message());
-								}
-								client->close();
-								return false;
-							};
-
-							if (length != size - sizeof(protocol_head))
-							{
-								if (m_close_client_callback_fun != nullptr)
-								{
-									m_close_client_callback_fun(client, "async_read size error.");
-								}
-								client->close();
-								return false;
-							}
-
-							data->m_receive_count += size;
-							data->m_receive_time_point = std::chrono::system_clock::now();
-
-							asio::post(m_io_context_, [this, client, data, length]() {
-								// 处理数据
-								if (m_deal_buf_callback_fun != nullptr)
-								{
-									if (!m_deal_buf_callback_fun(std::bind(&CTcpServer::_async_send, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4), client, data, data->m_buf.data() + sizeof(protocol_head), length))
+									if (ec)
 									{
-										if (m_close_client_callback_fun != nullptr)
-										{
-											m_close_client_callback_fun(client, "deal buf fail.");
-										}
+										if (on_log_ != nullptr) { on_log_("async read fail. ec: " + ec.message()); }
+										client->close();
+										return false;
+									};
+
+									if (length != receive_length - sizeof(protocol_head))
+									{
+										if (on_log_ != nullptr) { on_log_("async read size error: " + std::to_string(length)); }
 										client->close();
 										return false;
 									}
-								};
 
-								_async_receive(client, data);
-								return true;
-								});
+									client_data->receive_count_ += client_data->buf_.size();
+									client_data->receive_time_point_ = std::chrono::system_clock::now();
 
+									asio::post(io_context_, strand_.wrap([this, client, client_data]() {
+										// 处理数据
+										if (on_receive_ != nullptr)
+										{
+											if (!on_receive_(client, client_data->buf_.data(), client_data->buf_.size(), std::bind(&TcpServer::AsyncSend, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3)))
+											{
+												if (on_log_ != nullptr) { on_log_("close client: " + GetId(client) + ",deal buf fail."); }
+												client->close();
+												return false;
+											}
+										};
 
+										AsyncReceive(client);
+										return true;
+										}));
+									return true;
+								}));
+						};
+						return true;
+					}));
+			}
+			else
+			{
+				if (on_log_ != nullptr) { on_log_("default receive size: " + std::to_string(max_receive_size)); };
+
+				client_data->buf_.resize(max_receive_size);
+				asio::async_read(*client, asio::buffer(client_data->buf_.data(), client_data->buf_.size()), strand_.wrap([this, client, client_data](std::error_code ec, std::size_t length)
+					{
+						if (ec)
+						{
+							if (on_log_ != nullptr) { on_log_("async_read fail. close client: " + GetId(client) + " ec: " + ec.message()); }
+							client->close();
+							return false;
+						};
+
+						client_data->receive_count_ += client_data->buf_.size();
+						client_data->receive_time_point_ = std::chrono::system_clock::now();
+
+						asio::post(io_context_, strand_.wrap([this, client, client_data]() {
+							// 处理数据
+							if (on_receive_ != nullptr)
+							{
+								if (!on_receive_(client, client_data->buf_.data(), client_data->buf_.size(), std::bind(&TcpServer::AsyncSend, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3)))
+								{
+									if (on_log_ != nullptr) { on_log_("close client: " + GetId(client) + ",deal buf fail."); }
+									client->close();
+									return false;
+								}
+							};
+
+							if (on_log_ != nullptr) { on_log_("server read len: " + std::to_string(client_data->buf_.size())); };
+
+							AsyncReceive(client);
 							return true;
-
-						}));
-
-					return true;
-				}));
-
+							}));
+						return true;
+					}));
+			}
 			return true;
 		};
 	private:
-		bool __queue_send(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data) {
-			if (!m_appEnable)
-			{
-				return false;
-			}
+		bool QueueSend(std::shared_ptr<asio::ip::tcp::socket> client) {
+			if (!running_ || client == nullptr || !client->is_open()) { return false; }
 
-			if (client == nullptr || data == nullptr)
-			{
-				return false;
-			}
+			auto& client_data = client_data_map_[client];
+			if(client_data->send_queue_.empty()) { return false; }
 
-			if (!client->is_open())
-			{
-				return false;
-			}
-
-			if (data->m_send_queue.empty())
-			{
-				return false;
-			}
-
-			auto buf = data->m_send_queue.front();
-			data->m_send_queue.pop();
-
-			asio::async_write(*client, asio::buffer(buf->data(), buf->size()), m_strand.wrap([this, client, data](asio::error_code ec, std::size_t len) {
+			asio::async_write(*client, asio::buffer(client_data->send_queue_.front()->data(), client_data->send_queue_.front()->size()), strand_.wrap([this, client, client_data](asio::error_code ec, std::size_t len) {
 				if (ec)
 				{
-					if (m_close_client_callback_fun != nullptr)
-					{
-						m_close_client_callback_fun(client, "async write fail. ec: " + ec.message());
-					}
+					if (on_log_ != nullptr) { on_log_("client: " + GetId(client) + " async write fail. ec: " + ec.message()); }
 					client->close();
 					return false;
-
 				}
-				else
-				{
-					data->m_send_count += len;
-					data->m_send_time_point = std::chrono::system_clock::now();
 
-					__queue_send(client, data);
-					return true;
-				}
-				}));
-
-			return true;
-		};
-		bool __check_client() {
-			if (!m_appEnable)
-			{
-				return false;
-			}
-
-			std::unique_lock<decltype(m_client_data_mutex)> lock(m_client_data_mutex);
-			for (auto it = m_client_data_map.begin(); it != m_client_data_map.end();)
-			{
-				if ((*it).first != nullptr)
-				{
-					if (!(*it).first->is_open())
-					{
-						m_client_data_map.erase(it++);
-						continue;
-					}
-				}
-				it++;
-			}
-
-			m_check_client_timer.expires_after(std::chrono::milliseconds(100));
-			m_check_client_timer.async_wait(m_strand.wrap([this](std::error_code ec) {
-				if (ec)
-				{
-					return false;
-				}
-				__check_client();
+				client_data->send_count_ += len;
+				client_data->send_time_point_ = std::chrono::system_clock::now();
+				client_data->send_queue_.pop();
+				QueueSend(client);
 				return true;
 				}));
 			return true;
 		};
-		bool __delete_client() {
-			std::unique_lock<decltype(m_client_data_mutex)> lock(m_client_data_mutex);
-			for (auto it = m_client_data_map.begin(); it != m_client_data_map.end();)
+		bool CheckClient() {
+			if (!running_) { return false; }
+
+			check_client_timer_.expires_after(std::chrono::milliseconds(10));
+			check_client_timer_.async_wait(strand_.wrap([this](std::error_code ec) {
+				if (ec) { return false; }
+
+				for (auto it = client_data_map_.begin(); it != client_data_map_.end();)
+				{
+					if ((*it).first != nullptr)
+					{
+						if (!(*it).first->is_open())
+						{
+							client_data_map_.erase(it++);
+							continue;
+						}
+					}
+					it++;
+				}
+				CheckClient();
+				return true;
+				}));
+			return true;
+		};
+		bool DeleteClient() {
+			for (auto it = client_data_map_.begin(); it != client_data_map_.end();)
 			{
 				if ((*it).first != nullptr)
 				{
@@ -439,441 +383,368 @@ namespace Tcp
 						(*it).first->close();
 					}
 				}
-				m_client_data_map.erase(it++);
+				client_data_map_.erase(it++);
 			}
 			return true;
 		};
-		bool __timer() {
-			if (!m_appEnable)
-			{
-				return false;
-			}
+
+		bool DoTimer() {
+			if (!running_) { return false; }
 
 			static std::chrono::milliseconds milliseconds(100);
-			if (m_timer_callback_fun != nullptr)
-			{
-				if (!m_timer_callback_fun(milliseconds, std::make_shared<std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>>>(m_client_data_map)))
+			timer_.expires_after(milliseconds);
+			timer_.async_wait(strand_.wrap([&, this](std::error_code ec) {
+				if (ec) { return false; }
+				if (on_timer_ != nullptr)
 				{
-					return false;
+					if (!on_timer_(milliseconds, client_data_map_))
+					{
+						return false;
+					}
 				}
-			}
 
-			m_timer.expires_after(milliseconds);
-			m_timer.async_wait(m_strand.wrap([this](std::error_code ec) {
-				if (ec)
-				{
-					return false;
-				}
-				__timer();
+				DoTimer();
 				return true;
 				}));
 			return true;
 		};
 	private:
-		std::vector<std::thread> m_threads;
-		std::atomic<bool> m_appEnable;
+		std::vector<std::thread> threads_;
+		std::atomic<bool> running_;
 
-		asio::io_context m_io_context_;
-		asio::io_context::strand m_strand;
-		std::shared_ptr<asio::io_service::work> m_work;
-		std::shared_ptr<asio::ip::tcp::acceptor> m_acceptor_;
-		asio::steady_timer m_check_client_timer;
-		asio::steady_timer m_timer;
+		asio::io_context io_context_;
+		asio::io_context::strand strand_;
+		std::shared_ptr<asio::io_service::work> work_;
+		std::shared_ptr<asio::ip::tcp::acceptor> acceptor_;
+		asio::steady_timer check_client_timer_;
+		asio::steady_timer timer_;
 
-		std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client)> m_accept_client_callback_fun;
-
-		std::function<bool(std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size)> async_send_fun,
-			std::shared_ptr<asio::ip::tcp::socket> client,
-			std::shared_ptr<client_data> data,
-			const char* buf,
-			const int& size)> m_deal_buf_callback_fun;
-
-		std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const std::string& error)> m_close_client_callback_fun;
-
-		std::function<bool(std::chrono::milliseconds& milliseconds, std::shared_ptr<std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>>>)> m_timer_callback_fun;
-
-		std::function<bool(const std::string& msg)> m_log_callback_fun;
+		on_accept_type on_accept_;
+		on_receive_type on_receive_;
+		on_log_type on_log_;
+		on_timer_type on_timer_;
+		on_pre_receive_type on_pre_receive_;
 
 	private:
-		std::string m_ip;
-		std::string m_port;
+		std::string ip_;
+		std::string port_;
 
-		std::mutex m_client_data_mutex;
-		std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>> m_client_data_map;
+		std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<ClientData>> client_data_map_;
 	};
 
-
-
-
-	class CTcpClient
+	class TcpClient
 	{
 	public:
-		CTcpClient() = delete;
-		CTcpClient(const std::string& ip = "",
+		using on_log_type = std::function<bool(const std::string& msg)>;
+		using on_connect_type = std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client)>;
+		using on_send_type = std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size)>;
+		using on_pre_receive_type = std::function<int(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size)>;
+		using on_receive_type = std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size, on_send_type on_send)>;
+		using client_data_map_type = std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<ClientData>>;
+		using on_timer_type = std::function<bool(std::chrono::milliseconds& milliseconds, client_data_map_type&)>;
+
+	public:
+		TcpClient() = delete;
+		TcpClient(
+			const std::string& ip = "127.0.0.1",
 			const std::string& port = "8000",
-			std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client)> connect_server_callback_fun = nullptr,
-			std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const std::string& error)> close_client_callback_fun = nullptr,
-			std::function<bool(std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size)> async_send_fun, std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size)> handle_buf_callback_fun = nullptr,
-			std::function<bool(std::chrono::milliseconds& milliseconds, std::shared_ptr<std::pair<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>>>)> timer_callback_fun = nullptr,
-			std::function<bool(const std::string& msg)> log_callback_fun = nullptr)
-			: m_ip(ip)
-			, m_port(port)
-			, m_appEnable(true)
-			, m_strand(m_io_context_)
-			, m_connect_server_callback_fun(connect_server_callback_fun)
-			, m_close_client_callback_fun(close_client_callback_fun)
-			, m_deal_buf_callback_fun(handle_buf_callback_fun)
-			, m_timer_callback_fun(timer_callback_fun)
-			, m_log_callback_fun(log_callback_fun)
-			, m_check_client_timer(m_io_context_)
-			, m_timer(m_io_context_)
+			on_receive_type on_receive = nullptr,
+			on_connect_type on_connect = nullptr,
+			on_log_type on_log = nullptr,
+			on_timer_type on_timer = nullptr,
+			on_pre_receive_type on_pre_receive = [](std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size) {
+				auto receive_length = ((const protocol_head*)data)->size;
+				if (receive_length > max_receive_size || receive_length < sizeof(protocol_head)) { return -1; }
+				return receive_length;
+			}
+		)
+			: ip_(ip)
+			, port_(port)
+			, running_(true)
+			, strand_(io_context_)
+			, check_client_timer_(io_context_)
+			, timer_(io_context_)
+			, on_connect_(on_connect)
+			, on_receive_(on_receive)
+			, on_timer_(on_timer)
+			, on_log_(on_log)
+
 		{
 		}
 
-		~CTcpClient() {
-			m_io_context_.post([this]()
-				{
-					m_appEnable = false;
-
-					m_work.reset();
-				});
-
-			for (auto& t : m_threads)
+		~TcpClient() {
+			running_ = false;
+			work_.reset();
+			io_context_.stop();
+			while (!io_context_.stopped()) { std::this_thread::sleep_for(std::chrono::seconds(1)); }
+			for (auto& t : threads_)
 			{
 				t.join();
 			}
 		};
 	public:
-		bool run() {
-			_async_connect();
-			__timer();
+		bool Run() 
+		{
+			AsyncConnect();
+			DoTimer();
 
-			m_work = std::make_shared<asio::io_service::work>(asio::io_service::work(m_io_context_));
+			work_ = std::make_shared<asio::io_service::work>(asio::io_service::work(io_context_));
 
-			while (m_threads.size() < 1)
+			while (threads_.size() < 1)
 			{
-				m_threads.emplace_back(std::thread([this]()
+				threads_.emplace_back(std::thread([this]()
 					{
 						do
 						{
 							try
 							{
-								m_io_context_.run();
+								io_context_.run();
 								break;
 							}
 							catch (std::exception& e)
 							{
 								std::string error = e.what();
-								if (m_log_callback_fun != nullptr)
-								{
-									m_log_callback_fun(error);
-								}
+								if (on_log_ != nullptr) { on_log_(error); }
 							};
-						} while (m_appEnable);
+						} while (running_);
 					}));
 			};
-
+			if (on_log_ != nullptr) { on_log_("client run ..."); };
 			return true;
 		};
-	public:
-		bool AsyncSend(const char* buf, const int& size) {
-			return _async_send(m_client_data_pair.first, m_client_data_pair.second, buf, size);
-		};
+		bool Send(const char* data, const int& size)
+		{
+			if (data == nullptr) { return false; };
+
+			for (auto& it : client_data_map_)
+			{
+				if (it.first->is_open()) AsyncSend(it.first, data, size);
+			}
+	
+			return true;
+		}
 	private:
-		bool _async_connect() {
-			std::shared_ptr<asio::ip::tcp::socket> client = std::make_shared<asio::ip::tcp::socket>(m_io_context_);
-			client->async_connect(asio::ip::tcp::endpoint(asio::ip::address::from_string(m_ip.c_str()), atoi(m_port.c_str())), m_strand.wrap([this, client](asio::error_code ec) {
+		bool AsyncConnect() {
+			std::shared_ptr<asio::ip::tcp::socket> client = std::make_shared<asio::ip::tcp::socket>(io_context_);
+			client->async_connect(asio::ip::tcp::endpoint(asio::ip::address::from_string(ip_.c_str()), atoi(port_.c_str())), strand_.wrap([this, client](asio::error_code ec) {
 				if (ec)
 				{
-					std::this_thread::sleep_for(std::chrono::seconds(1));
-					if (m_log_callback_fun != nullptr)
-					{
-						m_log_callback_fun(ec.message());
-					}
-					_async_connect();
+					if (on_log_ != nullptr) { on_log_("connect fail: " + ec.message()); }
 					return false;
 				}
 
-				if (m_connect_server_callback_fun != nullptr)
+				if (on_connect_ != nullptr)
 				{
-					if (!m_connect_server_callback_fun(client))
+					if (!on_connect_(client) && running_)
 					{
-						if (m_close_client_callback_fun != nullptr)
-						{
-							m_close_client_callback_fun(client, "connect server fail.");
-						}
-						client->close();
-					}
-				}
+						AsyncConnect();
+						return false;
+					};
+				};
 
 				if (client->is_open())
 				{
-					std::string id;
-					try
-					{
-						id = client->remote_endpoint().address().to_string() + ":" + std::to_string(client->remote_endpoint().port());
-					}
-					catch (std::exception& e)
-					{
-						return false;
-					}
+					std::string id = GetId(client);
 
-					std::unique_lock<decltype(m_client_data_mutex)> lock(m_client_data_mutex);
-					m_client_data_pair = std::make_pair(client, std::shared_ptr<client_data>(new client_data(id)));
-					m_client_data_pair.second->m_connect_time_point = std::chrono::system_clock::now();
-					lock.unlock();
+					if (on_log_ != nullptr) { on_log_("client connect: " + id); };
 
-					_async_receive(client, m_client_data_pair.second);
+					if (client_data_map_.find(client) == client_data_map_.end())
+					{
+						client_data_map_[client] = std::make_shared<ClientData>(id);
+					}
+					
+					client_data_map_[client]->connect_time_point_ = std::chrono::system_clock::now();
+					AsyncReceive(client);
 				}
 				return true;
 				}));
 			return true;
 		};
-		bool _async_send(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size) {
-			if (!m_appEnable)
-			{
-				return false;
-			}
 
-			if (buf == nullptr || client == nullptr)
-			{
-				return false;
-			}
+		bool AsyncSend(std::shared_ptr<asio::ip::tcp::socket> client, const char* data, const int& size) {
+			if (!running_ || data == nullptr || client == nullptr || !client->is_open()) { return false; }
 
-			if (!client->is_open())
-			{
-				return false;
-			}
-
-			std::shared_ptr<std::vector<char>> buf_ = std::make_shared<std::vector<char>>(buf, buf + size);
-
-			if (buf_ == nullptr)
-			{
-				return false;
-			}
-
-			asio::post(m_io_context_, m_strand.wrap([this, client, data, buf_]()
+			std::shared_ptr<std::vector<char>> buf_ = std::make_shared<std::vector<char>>(data, data + size);
+			if (buf_ == nullptr) { return false; }
+			auto& client_data = client_data_map_[client];
+			asio::post(io_context_, strand_.wrap([this, client, client_data, buf_]()
 				{
-					data->m_send_queue.emplace(buf_);
-					__queue_send(client, data);
-
+					client_data->send_queue_.emplace(buf_);
+					QueueSend(client);
 					return true;
 
 				}));
-
 			return true;
 		};
-		bool _async_receive(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data) {
-			if (!m_appEnable)
+
+		bool AsyncReceive(std::shared_ptr<asio::ip::tcp::socket> client) {
+			if (!running_ || client == nullptr || !client->is_open()) { return false; }
+
+			auto& client_data = client_data_map_[client];
+
+			if (on_pre_receive_)
 			{
-				return false;
-			}
-
-			if (client == nullptr || data == nullptr)
-			{
-				return false;
-			}
-
-			if (!client->is_open())
-			{
-				return false;
-			}
-
-			data->m_buf.fill('\0');
-
-			asio::async_read(*client, asio::buffer(data->m_buf.data(), sizeof(protocol_head)), m_strand.wrap([this, client, data](std::error_code ec, std::size_t length)
-				{
-					if (ec)
+				client_data->buf_.resize(sizeof(protocol_head));
+				asio::async_read(*client, asio::buffer(client_data->buf_.data(), client_data->buf_.size()), strand_.wrap([this, client, client_data](std::error_code ec, std::size_t length)
 					{
-						if (m_close_client_callback_fun != nullptr)
+						if (ec)
 						{
-							m_close_client_callback_fun(client, "async_read fail. ec: " + ec.message());
-						}
-						client->close();
+							if (on_log_ != nullptr) { on_log_("Async_read fail. close client: " + GetId(client) + " ec: " + ec.message()); }
+							client->close();
+							return false;
+						};
 
-						std::this_thread::sleep_for(std::chrono::seconds(1));
-						_async_connect();
-						return false;
-					};
-
-					int size = ((const protocol_head*)data->m_buf.data())->size;
-					if (size > data->m_buf.size() || sizeof(protocol_head) > size)
-					{
-						if (m_close_client_callback_fun != nullptr)
+						if (on_pre_receive_)
 						{
-							m_close_client_callback_fun(client, "async_read size error.");
-						}
-						client->close();
-
-						std::this_thread::sleep_for(std::chrono::seconds(1));
-						_async_connect();
-						return false;
-					}
-
-					asio::async_read(*client, asio::buffer(data->m_buf.data() + sizeof(protocol_head), size - sizeof(protocol_head)), m_strand.wrap([this, client, data, size](std::error_code ec, std::size_t length)
-						{
-							if (ec)
+							auto receive_length = on_pre_receive_(client, client_data->buf_.data(), client_data->buf_.size());
+							if (receive_length > 0)
 							{
-								if (m_close_client_callback_fun != nullptr)
-								{
-									m_close_client_callback_fun(client, "async_read fail. ec: " + ec.message());
-								}
-								client->close();
+								client_data->buf_.resize(receive_length);
+								asio::async_read(*client, asio::buffer(client_data->buf_.data() + sizeof(protocol_head), receive_length - sizeof(protocol_head)), strand_.wrap([this, client, client_data, receive_length](std::error_code ec, std::size_t length)
+									{
+										if (ec)
+										{
+											if (on_log_ != nullptr) { on_log_("async_read fail. ec: " + ec.message()); }
+											client->close();
+											return false;
+										};
 
-								std::this_thread::sleep_for(std::chrono::seconds(1));
-								_async_connect();
-								return false;
+										if (length != receive_length - sizeof(protocol_head))
+										{
+											if (on_log_ != nullptr) { on_log_("async_read size error: " + std::to_string(length)); }
+											client->close();
+											return false;
+										}
+
+										client_data->receive_count_ += client_data->buf_.size();
+										client_data->receive_time_point_ = std::chrono::system_clock::now();
+
+										asio::post(io_context_, strand_.wrap([this, client, client_data]() {
+											// 处理数据
+											if (on_receive_ != nullptr)
+											{
+												if (!on_receive_(client, client_data->buf_.data(), client_data->buf_.size(), std::bind(&TcpClient::AsyncSend, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3)))
+												{
+													if (on_log_ != nullptr) { on_log_("close client: " + GetId(client) + ",deal buf fail."); }
+													client->close();
+													return false;
+												}
+											};
+
+											AsyncReceive(client);
+											return true;
+											}));
+										return true;
+									}));
+							};
+						}
+						return true;
+					}));
+			}
+			else
+			{
+				if (on_log_ != nullptr) { on_log_("default receive size: " + std::to_string(max_receive_size)); };
+
+				client_data->buf_.resize(max_receive_size);
+				asio::async_read(*client, asio::buffer(client_data->buf_.data(), client_data->buf_.size()), strand_.wrap([this, client, client_data](std::error_code ec, std::size_t length)
+					{
+						if (ec)
+						{
+							if (on_log_ != nullptr) { on_log_("async_read fail. close client: " + GetId(client) + " ec: " + ec.message()); }
+							client->close();
+							return false;
+						};
+
+						client_data->receive_count_ += client_data->buf_.size();
+						client_data->receive_time_point_ = std::chrono::system_clock::now();
+
+						asio::post(io_context_, strand_.wrap([this, client, client_data]() {
+							// 处理数据
+							if (on_receive_ != nullptr)
+							{
+								if (!on_receive_(client, client_data->buf_.data(), client_data->buf_.size(), std::bind(&TcpClient::AsyncSend, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3)))
+								{
+									if (on_log_ != nullptr) { on_log_("close client: " + GetId(client) + ",deal buf fail."); }
+									client->close();
+									return false;
+								}
 							};
 
-							if (length != size - sizeof(protocol_head))
-							{
-								if (m_close_client_callback_fun != nullptr)
-								{
-									m_close_client_callback_fun(client, "async_read size error.");
-								}
-								client->close();
+							if (on_log_ != nullptr) { on_log_("client receive len: " + std::to_string(client_data->buf_.size())); };
 
-								std::this_thread::sleep_for(std::chrono::seconds(1));
-								_async_connect();
-								return false;
-							}
-
-							data->m_receive_count += size;
-							data->m_receive_time_point = std::chrono::system_clock::now();
-
-							asio::post(m_io_context_, [this, client, data, length]() {
-								// 处理数据
-								if (m_deal_buf_callback_fun != nullptr)
-								{
-									if (!m_deal_buf_callback_fun(std::bind(&CTcpClient::_async_send, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4), client, data, data->m_buf.data() + sizeof(protocol_head), length))
-									{
-										if (m_close_client_callback_fun != nullptr)
-										{
-											m_close_client_callback_fun(client, "deal buf fail.");
-										}
-										client->close();
-
-										std::this_thread::sleep_for(std::chrono::seconds(1));
-										_async_connect();
-										return false;
-									}
-								};
-
-								_async_receive(client, data);
-								return true;
-								});
+							AsyncReceive(client);
 							return true;
-						}));
-					return true;
-				}));
+							}));
+						return true;
+					}));
+			}
 			return true;
 		};
 	private:
-		bool __queue_send(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data) {
-			if (!m_appEnable)
-			{
-				return false;
-			}
+		bool QueueSend(std::shared_ptr<asio::ip::tcp::socket> client) {
+			if (!running_ || client == nullptr || !client->is_open()) { return false; }
 
-			if (client == nullptr || data == nullptr)
-			{
-				return false;
-			}
+			auto& client_data = client_data_map_[client];
+			if (client_data->send_queue_.empty()) { return false; }
 
-			if (!client->is_open())
-			{
-				return false;
-			}
-
-			if (data->m_send_queue.empty())
-			{
-				return false;
-			}
-
-			auto buf = data->m_send_queue.front();
-			data->m_send_queue.pop();
-
-			asio::async_write(*client, asio::buffer(buf->data(), buf->size()), m_strand.wrap([this, client, data](asio::error_code ec, std::size_t len) {
+			asio::async_write(*client, asio::buffer(client_data->send_queue_.front()->data(), client_data->send_queue_.front()->size()), strand_.wrap([this, client, client_data](asio::error_code ec, std::size_t len) {
 				if (ec)
 				{
-					if (m_close_client_callback_fun != nullptr)
-					{
-						m_close_client_callback_fun(client, "async write fail. ec: " + ec.message());
-					}
+					if (on_log_ != nullptr) { on_log_("client: " + GetId(client) + " async write fail. ec: " + ec.message()); }
 					client->close();
-
-					std::this_thread::sleep_for(std::chrono::seconds(1));
-					_async_connect();
 					return false;
-
 				}
-				else
-				{
-					data->m_send_count += len;
-					data->m_send_time_point = std::chrono::system_clock::now();
 
-					__queue_send(client, data);
-					return true;
-				}
+				client_data->send_count_ += len;
+				client_data->send_time_point_ = std::chrono::system_clock::now();
+				client_data->send_queue_.pop();
+				QueueSend(client);
+				return true;
 				}));
-
 			return true;
 		};
-		bool __timer() {
-			if (!m_appEnable)
-			{
-				return false;
-			}
+
+		bool DoTimer() {
+			if (!running_) { return false; }
 
 			static std::chrono::milliseconds milliseconds(100);
-			if (m_timer_callback_fun != nullptr)
-			{
-				if (!m_timer_callback_fun(milliseconds, std::make_shared<std::pair<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>>>(m_client_data_pair)))
+			timer_.expires_after(milliseconds);
+			timer_.async_wait(strand_.wrap([&, this](std::error_code ec) {
+				if (ec) { return false; }
+				if (on_timer_ != nullptr)
 				{
-					return false;
+					if (!on_timer_(milliseconds, client_data_map_))
+					{
+						return false;
+					}
 				}
-			}
 
-			m_timer.expires_after(milliseconds);
-			m_timer.async_wait(m_strand.wrap([this](std::error_code ec) {
-				if (ec)
-				{
-					return false;
-				}
-				__timer();
+				DoTimer();
 				return true;
 				}));
 			return true;
 		};
 	private:
-		std::vector<std::thread> m_threads;
-		std::atomic<bool> m_appEnable;
+		std::vector<std::thread> threads_;
+		std::atomic<bool> running_;
 
-		asio::io_context m_io_context_;
-		asio::io_context::strand m_strand;
-		std::shared_ptr<asio::io_service::work> m_work;
-		asio::steady_timer m_check_client_timer;
-		asio::steady_timer m_timer;
+		asio::io_context io_context_;
+		asio::io_context::strand strand_;
+		std::shared_ptr<asio::io_service::work> work_;
+		asio::steady_timer check_client_timer_;
+		asio::steady_timer timer_;
 
-		std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client)> m_connect_server_callback_fun;
-
-		std::function<bool(std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, std::shared_ptr<client_data> data, const char* buf, const int& size)> async_send_fun,
-			std::shared_ptr<asio::ip::tcp::socket> client,
-			std::shared_ptr<client_data> data,
-			const char* buf,
-			const int& size)> m_deal_buf_callback_fun;
-
-		std::function<bool(std::shared_ptr<asio::ip::tcp::socket> client, const std::string& error)> m_close_client_callback_fun;
-
-		std::function<bool(std::chrono::milliseconds& milliseconds, std::shared_ptr<std::pair<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>>>)> m_timer_callback_fun;
-
-		std::function<bool(const std::string& msg)> m_log_callback_fun;
+		on_connect_type on_connect_;
+		on_receive_type on_receive_;
+		on_log_type on_log_;
+		on_timer_type on_timer_;
+		on_pre_receive_type on_pre_receive_;
 
 	private:
-		std::string m_ip;
-		std::string m_port;
+		std::string ip_;
+		std::string port_;
 
-		std::mutex m_client_data_mutex;
-		std::pair<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<client_data>> m_client_data_pair;
+		std::map<std::shared_ptr<asio::ip::tcp::socket>, std::shared_ptr<ClientData>> client_data_map_;
 	};
+}
 }
